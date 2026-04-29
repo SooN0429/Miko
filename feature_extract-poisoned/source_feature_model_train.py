@@ -158,6 +158,26 @@ def parse_args() -> argparse.Namespace:
             "models3、models3_1、models3_2、models4、models4_1、models4_2。"
         ),
     )
+
+    # Early stopping (based on eval_acc)
+    parser.add_argument(
+        "--early_stop_patience",
+        type=int,
+        default=5,
+        help="若 eval_acc 在連續 patience 個 epoch 未提升則提前停止；0 表示關閉。",
+    )
+    parser.add_argument(
+        "--early_stop_delta",
+        type=float,
+        default=1e-4,
+        help="判斷是否提升的最小幅度：acc > best_acc + delta 才算進步。",
+    )
+    parser.add_argument(
+        "--early_stop_min_epoch",
+        type=int,
+        default=1,
+        help="最少訓練到第幾個 epoch（才允許 early stopping）。",
+    )
     return parser.parse_args()
 
 
@@ -343,7 +363,11 @@ def main() -> None:
         per_digit_k=args.per_digit_k,
     )
 
-    best_acc = 0.0
+    best_acc = -float("inf")
+    epochs_no_improve = 0
+    early_stop_patience = args.early_stop_patience
+    early_stop_delta = args.early_stop_delta
+    early_stop_min_epoch = args.early_stop_min_epoch
     log_interval = SFCFG["log_interval"]
     for epoch in range(1, args.epoch + 1):
         train_loss = train_one_epoch(
@@ -360,8 +384,23 @@ def main() -> None:
             device=device,
             class_names=class_names,
         )
-        if acc > best_acc:
+        if acc > best_acc + early_stop_delta:
             best_acc = acc
+            epochs_no_improve = 0
+        else:
+            epochs_no_improve += 1
+
+        if (
+            early_stop_patience > 0
+            and epoch >= early_stop_min_epoch
+            and epochs_no_improve >= early_stop_patience
+        ):
+            print(
+                f"[EarlyStop] Stop at epoch={epoch} "
+                f"(best_eval_acc={best_acc*100:.2f}%, epochs_no_improve={epochs_no_improve})"
+            )
+            break
+
         if (epoch - 1) % log_interval == 0 or epoch == 1:
             print(
                 f"[Epoch {epoch:03d}/{args.epoch:03d}] "
@@ -386,6 +425,30 @@ def main() -> None:
                 tp_str = f"{tp_val:.3f}" if tp_val == tp_val else "N/A"
                 fp_str = f"{fp_val:.3f}" if fp_val == fp_val else "N/A"
                 print(f"  TP Confidence (correct): {tp_str}, FP Confidence (wrong): {fp_str}")
+
+                # Confusion Matrix 與 per-class TN/FP（one-vs-rest）
+                cm = details.get("confusion_matrix")
+                if cm is not None:
+                    num_classes = len(class_names)
+                    print("  Confusion Matrix (rows=true, cols=pred):")
+                    header = " " * 10 + " ".join([f"{name:>10}" for name in class_names])
+                    print(f"  {header}")
+                    for i, true_name in enumerate(class_names):
+                        row = " ".join([f"{cm[i][j]:>10d}" for j in range(num_classes)])
+                        print(f"  {true_name:<10} {row}")
+
+                per_class_tp = details.get("per_class_tp_count", {})
+                per_class_fp = details.get("per_class_fp_count", {})
+                per_class_tn = details.get("per_class_tn_count", {})
+                per_class_fn = details.get("per_class_fn_count", {})
+                if cm is not None or per_class_tn or per_class_fp:
+                    print("  Per-class TN/FP counts (one-vs-rest):")
+                    for name in class_names:
+                        tp = per_class_tp.get(name, 0)
+                        fp = per_class_fp.get(name, 0)
+                        tn = per_class_tn.get(name, 0)
+                        fn = per_class_fn.get(name, 0)
+                        print(f"    {name}: TN={tn}, FP={fp}, FN={fn}, TP={tp}")
 
     if args.save_model_path:
         # 根據 feature_root 判斷 source / target，並在 save_model_path 底下建立對應子資料夾與自動檔名
